@@ -1,56 +1,67 @@
-export type PCMChunkHandler = (chunk: Int16Array) => void;
-
-function downsampleBuffer(buffer: Float32Array, inputSampleRate: number, outputSampleRate: number): Float32Array {
-  if (outputSampleRate === inputSampleRate) return buffer;
-  if (outputSampleRate > inputSampleRate) throw new Error('Output sample rate must be <= input sample rate');
-
-  const sampleRateRatio = inputSampleRate / outputSampleRate;
-  const newLength = Math.round(buffer.length / sampleRateRatio);
-  const result = new Float32Array(newLength);
-  let offsetResult = 0;
-  let offsetBuffer = 0;
-
-  while (offsetResult < result.length) {
-    const nextOffsetBuffer = Math.round((offsetResult + 1) * sampleRateRatio);
-    let accum = 0;
-    let count = 0;
-    for (let i = offsetBuffer; i < nextOffsetBuffer && i < buffer.length; i++) {
-      accum += buffer[i];
-      count++;
-    }
-    result[offsetResult] = count ? accum / count : 0;
-    offsetResult++;
-    offsetBuffer = nextOffsetBuffer;
-  }
-
-  return result;
-}
+export type AudioPipelineCallbacks = {
+  onPcm16k?: (base64: string) => void;
+  onInputActivity?: (active: boolean) => void;
+};
 
 function floatTo16BitPCM(input: Float32Array): Int16Array {
   const output = new Int16Array(input.length);
   for (let i = 0; i < input.length; i++) {
-    const s = Math.max(-1, Math.min(1, input[i]));
-    output[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
+    const sample = Math.max(-1, Math.min(1, input[i]));
+    output[i] = sample < 0 ? sample * 0x8000 : sample * 0x7fff;
   }
   return output;
 }
 
+function resample(input: Float32Array, inputRate: number, outputRate: number): Float32Array {
+  if (inputRate === outputRate) return input;
+  const ratio = inputRate / outputRate;
+  const outputLength = Math.max(1, Math.round(input.length / ratio));
+  const output = new Float32Array(outputLength);
+
+  for (let i = 0; i < outputLength; i++) {
+    const sourceIndex = i * ratio;
+    const left = Math.floor(sourceIndex);
+    const right = Math.min(left + 1, input.length - 1);
+    const fraction = sourceIndex - left;
+    output[i] = input[left] * (1 - fraction) + input[right] * fraction;
+  }
+  return output;
+}
+
+function int16ToBase64(samples: Int16Array): string {
+  const bytes = new Uint8Array(samples.buffer, samples.byteOffset, samples.byteLength);
+  let binary = '';
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    binary += String.fromCharCode(...bytes.subarray(i, Math.min(i + chunkSize, bytes.length)));
+  }
+  return btoa(binary);
+}
+
+function base64ToInt16(base64: string): Int16Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Int16Array(bytes.buffer);
+}
+
 export class AudioPipeline {
-  private stream: MediaStream | null = null;
   private inputContext: AudioContext | null = null;
-  private source: MediaStreamAudioSourceNode | null = null;
-  private worklet: AudioWorkletNode | null = null;
-  private gain: GainNode | null = null;
   private outputContext: AudioContext | null = null;
-  private nextOutputTime = 0;
-  private outputSources = new Set<AudioBufferSourceNode>();
-  private active = false;
+  private inputStream: MediaStream | null = null;
+  private source: MediaStreamAudioSourceNode | null = null;
+  private processor: ScriptProcessorNode | null = null;
+  private outputNextTime = 0;
+  private callbacks: AudioPipelineCallbacks;
 
-  async start(onPcmChunk: PCMChunkHandler): Promise<void> {
-    if (this.active) return;
-    if (!navigator.mediaDevices?.getUserMedia) throw new Error('Microphone is unavailable in this browser.');
+  constructor(callbacks: AudioPipelineCallbacks = {}) {
+    this.callbacks = callbacks;
+  }
 
-    this.stream = await navigator.mediaDevices.getUserMedia({
+  async start(): Promise<void> {
+    if (this.inputContext) return;
+
+    this.inputStream = await navigator.mediaDevices.getUserMedia({
       audio: {
         channelCount: 1,
         echoCancellation: true,
@@ -60,76 +71,65 @@ export class AudioPipeline {
     });
 
     this.inputContext = new AudioContext();
-    await this.inputContext.audioWorklet.addModule('/audio-processor.js');
+    this.outputContext = new AudioContext({ sampleRate: 24000 });
+    await this.inputContext.resume();
+    await this.outputContext.resume();
 
-    this.source = this.inputContext.createMediaStreamSource(this.stream);
-    this.worklet = new AudioWorkletNode(this.inputContext, 'pcm-processor', {
-      numberOfInputs: 1,
-      numberOfOutputs: 1,
-      channelCount: 1,
-      processorOptions: {}
-    });
-    this.gain = this.inputContext.createGain();
-    this.gain.gain.value = 0;
+    this.source = this.inputContext.createMediaStreamSource(this.inputStream);
+    this.processor = this.inputContext.createScriptProcessor(2048, 1, 1);
 
-    this.worklet.port.onmessage = (event: MessageEvent<Float32Array>) => {
-      if (!this.active) return;
-      const downsampled = downsampleBuffer(event.data, this.inputContext!.sampleRate, 16000);
-      const pcm = floatTo16BitPCM(downsampled);
-      if (pcm.length) onPcmChunk(pcm);
+    this.processor.onaudioprocess = (event) => {
+      const input = event.inputBuffer.getChannelData(0);
+      const rms = Math.sqrt(input.reduce((sum, value) => sum + value * value, 0) / input.length);
+      this.callbacks.onInputActivity?.(rms > 0.015);
+      const pcm = floatTo16BitPCM(resample(input, this.inputContext!.sampleRate, 16000));
+      this.callbacks.onPcm16k?.(int16ToBase64(pcm));
     };
 
-    this.source.connect(this.worklet);
-    this.worklet.connect(this.gain);
-    this.gain.connect(this.inputContext.destination);
-
-    this.outputContext = new AudioContext({ sampleRate: 24000 });
-    await this.outputContext.resume();
-    await this.inputContext.resume();
-    this.nextOutputTime = this.outputContext.currentTime;
-    this.active = true;
+    this.source.connect(this.processor);
+    this.processor.connect(this.inputContext.destination);
   }
 
-  async playPcm24k(base64: string): Promise<void> {
+  playPcm24k(base64: string): void {
     if (!this.outputContext) return;
-    const bytes = Uint8Array.from(atob(base64), c => c.charCodeAt(0));
-    const pcm = new Int16Array(bytes.buffer);
-    const audioBuffer = this.outputContext.createBuffer(1, pcm.length, 24000);
-    const channel = audioBuffer.getChannelData(0);
-    for (let i = 0; i < pcm.length; i++) channel[i] = pcm[i] / 32768;
+    const samples = base64ToInt16(base64);
+    const buffer = this.outputContext.createBuffer(1, samples.length, 24000);
+    const channel = buffer.getChannelData(0);
+    for (let i = 0; i < samples.length; i++) channel[i] = samples[i] / 32768;
 
     const source = this.outputContext.createBufferSource();
-    source.buffer = audioBuffer;
+    source.buffer = buffer;
     source.connect(this.outputContext.destination);
-    const startAt = Math.max(this.outputContext.currentTime + 0.01, this.nextOutputTime);
-    source.start(startAt);
-    this.nextOutputTime = startAt + audioBuffer.duration;
-    this.outputSources.add(source);
-    source.onended = () => this.outputSources.delete(source);
+
+    const now = this.outputContext.currentTime;
+    this.outputNextTime = Math.max(this.outputNextTime, now + 0.01);
+    source.start(this.outputNextTime);
+    this.outputNextTime += buffer.duration;
   }
 
   stopPlayback(): void {
-    for (const source of this.outputSources) {
-      try { source.stop(); } catch { /* already stopped */ }
+    // Recreate the output context on demand to flush already-buffered model audio.
+    if (this.outputContext) {
+      void this.outputContext.close();
+      this.outputContext = new AudioContext({ sampleRate: 24000 });
+      this.outputNextTime = 0;
+      void this.outputContext.resume();
     }
-    this.outputSources.clear();
-    if (this.outputContext) this.nextOutputTime = this.outputContext.currentTime;
   }
 
   async stop(): Promise<void> {
-    this.active = false;
-    this.stopPlayback();
-    this.worklet?.disconnect();
+    this.processor?.disconnect();
     this.source?.disconnect();
-    this.gain?.disconnect();
-    this.stream?.getTracks().forEach(t => t.stop());
-    await this.inputContext?.close().catch(() => undefined);
-    await this.outputContext?.close().catch(() => undefined);
-    this.worklet = null;
-    this.source = null;
-    this.gain = null;
+    this.inputStream?.getTracks().forEach((track) => track.stop());
+
+    if (this.inputContext) await this.inputContext.close().catch(() => undefined);
+    if (this.outputContext) await this.outputContext.close().catch(() => undefined);
+
     this.inputContext = null;
     this.outputContext = null;
-    this.stream = null;
+    this.inputStream = null;
+    this.source = null;
+    this.processor = null;
+    this.outputNextTime = 0;
   }
 }

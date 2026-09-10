@@ -3,7 +3,8 @@
   "short_name": "Companion",
   "start_url": "/",
   "display": "standalone",
-  "background_color": "#050505",
-  "theme_color": "#050505",
+  "background_color": "#05070c",
+  "theme_color": "#05070c",
+  "description": "Realtime Vietnamese voice companion powered by Gemini Live API",
   "icons": []
 }

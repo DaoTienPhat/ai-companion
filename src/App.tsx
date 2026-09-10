@@ -1,111 +1,118 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { AudioPipeline } from './audio/AudioPipeline';
-import { GeminiLive } from './gemini/GeminiLive';
+import { useRef, useState } from 'react';
 import './App.css';
+import { GeminiLive } from './gemini/GeminiLive';
+import { AudioPipeline } from './audio/AudioPipeline';
 
 type Status = 'idle' | 'connecting' | 'listening' | 'speaking' | 'error';
 
-type TranscriptLine = { role: 'user' | 'ai'; text: string };
+type Line = { speaker: 'you' | 'gemini'; text: string };
 
 export default function App() {
-  const audio = useMemo(() => new AudioPipeline(), []);
-  const geminiRef = useRef<GeminiLive | null>(null);
   const [status, setStatus] = useState<Status>('idle');
+  const [lines, setLines] = useState<Line[]>([]);
   const [error, setError] = useState('');
-  const [lastSpeech, setLastSpeech] = useState('');
-  const [transcript, setTranscript] = useState<TranscriptLine[]>([]);
+  const liveRef = useRef<GeminiLive | null>(null);
+  const audioRef = useRef<AudioPipeline | null>(null);
 
-  useEffect(() => () => {
-    geminiRef.current?.close();
-    void audio.stop();
-  }, [audio]);
-
-  const label = {
-    idle: 'Chạm để nói chuyện',
-    connecting: 'Đang kết nối…',
-    listening: 'Mình đang nghe',
-    speaking: 'Gemini đang nói',
-    error: 'Có lỗi xảy ra'
-  }[status];
+  const appendTranscript = (speaker: Line['speaker'], text: string, interim = false) => {
+    setLines((current) => {
+      if (interim) {
+        const next = [...current];
+        let index = -1;
+        for (let i = next.length - 1; i >= 0; i--) {
+          if (next[i].speaker === speaker) { index = i; break; }
+        }
+        if (index >= 0 && next[index].text.startsWith('…')) {
+          next[index] = { speaker, text: `…${text}` };
+          return next;
+        }
+      }
+      return [...current, { speaker, text }];
+    });
+  };
 
   const start = async () => {
-    setError('');
-    setStatus('connecting');
     try {
-      const gemini = new GeminiLive({
+      setError('');
+      setStatus('connecting');
+
+      const audio = new AudioPipeline({
+        onPcm16k: (base64) => liveRef.current?.sendAudio(base64),
+        onInputActivity: (active) => {
+          if (active) audioRef.current?.stopPlayback();
+        }
+      });
+      audioRef.current = audio;
+      await audio.start();
+
+      const live = new GeminiLive({
         onOpen: () => setStatus('listening'),
-        onError: e => {
-          setError(e.message);
+        onAudio: (base64) => {
+          setStatus('speaking');
+          audio.playPcm24k(base64);
+        },
+        onInputTranscript: (text, interim) => appendTranscript('you', interim ? text : text, interim),
+        onOutputTranscript: (text) => appendTranscript('gemini', text),
+        onTurnComplete: () => setStatus('listening'),
+        onError: (message) => {
+          setError(message);
           setStatus('error');
         },
-        onClose: reason => {
-          if (reason && status !== 'idle') setError(`Kết nối đã đóng: ${reason}`);
-        },
-        onAudio: async audioChunk => {
-          setStatus('speaking');
-          await audio.playPcm24k(audioChunk);
-          setLastSpeech(new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }));
-        },
-        onInputTranscript: text => {
-          setTranscript(t => [...t, { role: 'user', text }]);
-        },
-        onOutputTranscript: text => {
-          setTranscript(t => [...t, { role: 'ai', text }]);
-        },
-        onTurnComplete: () => setStatus('listening'),
-        onInterrupted: () => {
-          audio.stopPlayback();
-          setStatus('listening');
-        },
-        onActivityStart: () => setStatus('listening')
+        onClose: () => {
+          if (status !== 'error') setStatus('idle');
+        }
       });
-      geminiRef.current = gemini;
-      await gemini.connect();
-      await audio.start(chunk => gemini.sendAudio(chunk));
+      liveRef.current = live;
+      await live.connect();
     } catch (e) {
-      await audio.stop();
-      geminiRef.current?.close();
-      geminiRef.current = null;
-      setError(e instanceof Error ? e.message : 'Unknown error');
+      const message = e instanceof Error ? e.message : 'Unable to start the companion.';
+      setError(message);
       setStatus('error');
+      await audioRef.current?.stop();
+      audioRef.current = null;
     }
   };
 
   const stop = async () => {
-    geminiRef.current?.close();
-    geminiRef.current = null;
-    await audio.stop();
+    liveRef.current?.close();
+    liveRef.current = null;
+    await audioRef.current?.stop();
+    audioRef.current = null;
     setStatus('idle');
   };
 
-  const toggle = () => status === 'idle' || status === 'error' ? void start() : void stop();
+  const toggle = () => (status === 'idle' || status === 'error' ? start() : stop());
+  const active = status !== 'idle' && status !== 'error';
 
   return (
-    <main className={`app state-${status}`}>
-      <header className="topbar">
-        <div className="brand">COMPANION</div>
-        <div className="live-dot" aria-hidden="true" />
-      </header>
+    <main className="app-shell">
+      <section className={`companion ${active ? 'active' : ''}`}>
+        <div className="eyebrow">AI COMPANION</div>
+        <div className={`orb orb-${status}`} aria-label={status}>
+          <div className="orb-core" />
+        </div>
+        <h1>{status === 'idle' ? 'I’m here.' : status === 'speaking' ? 'I’m listening.' : status === 'error' ? 'Something went wrong.' : 'Talk to me.'}</h1>
+        <p className="hint">
+          {status === 'idle' ? 'Tap once. Then just talk naturally.' :
+           status === 'connecting' ? 'Connecting to Gemini…' :
+           status === 'speaking' ? 'You can interrupt me anytime.' :
+           status === 'error' ? error : 'Listening…'}
+        </p>
 
-      <section className="stage">
-        <div className="orb" aria-hidden="true"><div className="orb-inner" /><div className="orb-ring" /></div>
-        <div className="status-label">{label}</div>
-        {error && <div className="error-label">{error}</div>}
-      </section>
-
-      <section className="bottom">
-        <button className="talk" onClick={toggle} aria-label={label}>
-          <span className="talk-core" />
+        <button className={`talk-button ${active ? 'stop' : ''}`} onClick={toggle} aria-label={active ? 'Stop conversation' : 'Start conversation'}>
+          <span className="mic-dot" />
+          {active ? 'END' : 'TALK'}
         </button>
-        <div className="hint">Không cần nhìn màn hình.</div>
-        {lastSpeech && <div className="last-seen">Voice session · {lastSpeech}</div>}
-      </section>
 
-      {transcript.length > 0 && (
-        <aside className="transcript" aria-live="polite">
-          {transcript.slice(-4).map((line, i) => <p key={`${i}-${line.text}`}><b>{line.role === 'user' ? 'Bạn' : 'AI'}</b>{line.text}</p>)}
-        </aside>
-      )}
+        <div className="transcript" aria-live="polite">
+          {lines.slice(-8).map((line, index) => (
+            <div className={`line ${line.speaker}`} key={`${index}-${line.text}`}>
+              <span>{line.speaker === 'you' ? 'YOU' : 'GEMINI'}</span>
+              <p>{line.text}</p>
+            </div>
+          ))}
+        </div>
+      </section>
     </main>
   );
 }

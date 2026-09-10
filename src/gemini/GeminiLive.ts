@@ -1,91 +1,74 @@
 export type GeminiCallbacks = {
   onOpen?: () => void;
   onClose?: (reason: string) => void;
-  onError?: (error: Error) => void;
+  onError?: (message: string) => void;
   onAudio?: (base64Pcm24k: string) => void;
-  onInputTranscript?: (text: string) => void;
+  onInputTranscript?: (text: string, interim: boolean) => void;
   onOutputTranscript?: (text: string) => void;
   onTurnComplete?: () => void;
-  onInterrupted?: () => void;
-  onActivityStart?: () => void;
-  onActivityEnd?: () => void;
 };
 
 const MODEL = 'gemini-3.1-flash-live-preview';
-
-function bytesToBase64(bytes: Int16Array): string {
-  const u8 = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let binary = '';
-  const step = 0x8000;
-  for (let i = 0; i < u8.length; i += step) {
-    binary += String.fromCharCode(...u8.subarray(i, Math.min(i + step, u8.length)));
-  }
-  return btoa(binary);
-}
-
-export type GeminiCallbacks = {
-  onOpen?: () => void;
-  onClose?: (reason: string) => void;
-  onError?: (error: Error) => void;
-  onAudio?: (base64Pcm24k: string) => void;
-  onInputTranscript?: (text: string) => void;
-  onOutputTranscript?: (text: string) => void;
-  onTurnComplete?: () => void;
-  onInterrupted?: () => void;
-  onActivityStart?: () => void;
-  onActivityEnd?: () => void;
-};
-
-const MODEL = 'gemini-3.1-flash-live-preview';
-
-function bytesToBase64(bytes: Int16Array): string {
-  const u8 = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength);
-  let binary = '';
-  const step = 0x8000;
-  for (let i = 0; i < u8.length; i += step) {
-    const slice = u8.subarray(i, Math.min(i + step, u8.length));
-    let piece = '';
-    for (let j = 0; j < slice.length; j++) piece += String.fromCharCode(slice[j]);
-    binary += piece;
-  }
-  return btoa(binary);
-}
+const WS_BASE = 'wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained';
 
 export class GeminiLive {
-  private websocket: WebSocket | null = null;
+  private ws: WebSocket | null = null;
   private callbacks: GeminiCallbacks;
 
-  constructor(callbacks: GeminiCallbacks) {
+  constructor(callbacks: GeminiCallbacks = {}) {
     this.callbacks = callbacks;
   }
 
   async connect(): Promise<void> {
-    const response = await fetch('/api/token');
-    if (!response.ok) throw new Error(`Token request failed (${response.status})`);
-    const { token } = await response.json() as { token: string };
-    if (!token) throw new Error('Gemini token was empty.');
+    this.close();
 
-    const url = `wss://generativelanguage.googleapis.com/ws/google.ai.generativelanguage.v1beta.GenerativeService.BidiGenerateContentConstrained?access_token=${encodeURIComponent(token)}`;
-    const ws = new WebSocket(url);
-    this.websocket = ws;
+    const response = await fetch('/api/token');
+    if (!response.ok) {
+      const body = await response.json().catch(() => ({}));
+      throw new Error(body.error ?? `Token request failed (${response.status})`);
+    }
+
+    const { token } = (await response.json()) as { token: string };
+    const url = `${WS_BASE}?access_token=${encodeURIComponent(token)}`;
 
     await new Promise<void>((resolve, reject) => {
+      const ws = new WebSocket(url);
+      this.ws = ws;
+
       let opened = false;
+
       ws.onopen = () => {
         opened = true;
         ws.send(JSON.stringify({
           setup: {
             model: `models/${MODEL}`,
+            responseModalities: ['AUDIO'],
+            inputAudioTranscription: {},
+            outputAudioTranscription: {},
+            contextWindowCompression: {
+              slidingWindow: {}
+            },
+            systemInstruction: {
+              parts: [{
+                text: [
+                  'Bạn là một AI companion nói tiếng Việt, thân thiện và tự nhiên.',
+                  'Mục tiêu là trò chuyện như một người bạn thông minh trong đời thực, không phải chatbot đọc kịch bản.',
+                  'Trả lời ngắn gọn khi câu hỏi đơn giản; chỉ giải thích dài khi cần.',
+                  'Ưu tiên giọng nói tự nhiên, có nhịp nghỉ hợp lý, không lặp lại câu hỏi của người dùng.',
+                  'Khi người dùng đang nói thì không cố tranh lời; hãy tận dụng cơ chế ngắt lời realtime.',
+                  'Không tự giới thiệu dài dòng. Khi phiên bắt đầu, chỉ chào ngắn và mời người dùng nói chuyện.'
+                ].join(' ')
+              }]
+            },
             generationConfig: {
-              responseModalities: ['AUDIO'],
               speechConfig: {
                 voiceConfig: {
-                  prebuiltVoiceConfig: { voiceName: 'Puck' }
+                  prebuiltVoiceConfig: {
+                    voiceName: 'Puck'
+                  }
                 }
               }
             },
-            inputAudioTranscription: {},
-            outputAudioTranscription: {},
             realtimeInputConfig: {
               automaticActivityDetection: {
                 disabled: false,
@@ -95,22 +78,6 @@ export class GeminiLive {
                 silenceDurationMs: 650
               },
               activityHandling: 'START_OF_ACTIVITY_INTERRUPTS'
-            },
-            contextWindowCompression: {
-              slidingWindow: {}
-            },
-            systemInstruction: {
-              parts: [{
-                text: [
-                  'Bạn là một AI companion nói tiếng Việt tự nhiên.',
-                  'Mục tiêu là tạo cảm giác như một cuộc trò chuyện thật giữa hai người.',
-                  'Không nói kiểu trợ lý tổng đài, không trả lời dài dòng.',
-                  'Thường trả lời 1-3 câu ngắn, nhưng không phải lúc nào cũng hỏi lại.',
-                  'Chủ động duy trì chủ đề khi tự nhiên. Có thể hỏi tiếp khi người dùng bỏ lửng.',
-                  'Cho phép người dùng ngắt lời. Khi người dùng chen ngang, dừng ý đang nói và lắng nghe.',
-                  'Không cần chào lại ở mỗi lượt. Gọi người dùng là “bạn” và giữ giọng thân thiện, bình tĩnh.'
-                ].join(' ')
-              }]
             }
           }
         }));
@@ -118,56 +85,31 @@ export class GeminiLive {
         resolve();
       };
 
+      ws.onmessage = (event) => {
+        this.handleMessage(event.data);
+      };
+
       ws.onerror = () => {
-        const error = new Error('Gemini Live WebSocket error.');
-        this.callbacks.onError?.(error);
-        if (!opened) reject(error);
+        const message = 'Gemini Live WebSocket error.';
+        this.callbacks.onError?.(message);
+        if (!opened) reject(new Error(message));
       };
 
-      ws.onclose = e => {
-        this.callbacks.onClose?.(e.reason || `code ${e.code}`);
-        if (!opened) reject(new Error(`Gemini Live closed before setup (code ${e.code}).`));
+      ws.onclose = (event) => {
+        this.ws = null;
+        const reason = event.reason || `WebSocket closed (${event.code})`;
+        this.callbacks.onClose?.(reason);
+        if (!opened) reject(new Error(reason));
       };
-
-      ws.onmessage = e => this.handleMessage(e.data);
     });
   }
 
-  private handleMessage(raw: string): void {
-    let message: any;
-    try { message = JSON.parse(raw); } catch { return; }
-
-    if (message.setupComplete) return;
-    if (message.goAway) {
-      this.callbacks.onError?.(new Error('Gemini requested a reconnect soon.'));
-    }
-
-    const serverContent = message.serverContent;
-    if (!serverContent) return;
-
-    if (serverContent.interrupted) this.callbacks.onInterrupted?.();
-    if (serverContent.turnComplete) this.callbacks.onTurnComplete?.();
-    if (serverContent.inputTranscription?.text) {
-      this.callbacks.onInputTranscript?.(serverContent.inputTranscription.text);
-    }
-    if (serverContent.outputTranscription?.text) {
-      this.callbacks.onOutputTranscript?.(serverContent.outputTranscription.text);
-    }
-    if (serverContent.activityStart) this.callbacks.onActivityStart?.();
-    if (serverContent.activityEnd) this.callbacks.onActivityEnd?.();
-
-    for (const part of serverContent.modelTurn?.parts ?? []) {
-      const audio = part.inlineData?.data;
-      if (audio) this.callbacks.onAudio?.(audio);
-    }
-  }
-
-  sendAudio(chunk: Int16Array): void {
-    if (this.websocket?.readyState !== WebSocket.OPEN) return;
-    this.websocket.send(JSON.stringify({
+  sendAudio(base64Pcm16k: string): void {
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({
       realtimeInput: {
         audio: {
-          data: bytesToBase64(chunk),
+          data: base64Pcm16k,
           mimeType: 'audio/pcm;rate=16000'
         }
       }
@@ -175,12 +117,52 @@ export class GeminiLive {
   }
 
   sendText(text: string): void {
-    if (this.websocket?.readyState !== WebSocket.OPEN) return;
-    this.websocket.send(JSON.stringify({ realtimeInput: { text } }));
+    if (this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ realtimeInput: { text } }));
   }
 
   close(): void {
-    this.websocket?.close(1000, 'client closed');
-    this.websocket = null;
+    if (this.ws) {
+      this.ws.close(1000, 'client closed');
+      this.ws = null;
+    }
+  }
+
+  private handleMessage(raw: string): void {
+    let message: any;
+    try {
+      message = JSON.parse(raw);
+    } catch {
+      return;
+    }
+
+    if (message.error) {
+      this.callbacks.onError?.(message.error.message ?? 'Gemini Live returned an error.');
+      return;
+    }
+
+    const content = message.serverContent;
+    if (!content) return;
+
+    if (content.modelTurn?.parts) {
+      for (const part of content.modelTurn.parts) {
+        if (part.inlineData?.data) {
+          this.callbacks.onAudio?.(part.inlineData.data);
+        }
+      }
+    }
+
+    if (content.interimInputTranscription?.text) {
+      this.callbacks.onInputTranscript?.(content.interimInputTranscription.text, true);
+    }
+    if (content.inputTranscription?.text) {
+      this.callbacks.onInputTranscript?.(content.inputTranscription.text, false);
+    }
+    if (content.outputTranscription?.text) {
+      this.callbacks.onOutputTranscript?.(content.outputTranscription.text);
+    }
+    if (content.turnComplete) {
+      this.callbacks.onTurnComplete?.();
+    }
   }
 }
